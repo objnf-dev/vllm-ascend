@@ -972,21 +972,24 @@ class HybridXliteBase(XliteModelBase):
     ) -> torch.Tensor:
         """Rewrite the scheduler's mamba block table into xlite's widened state-descriptor layout.
 
-        The scheduler table ``[rows, W]`` holds the committed page (col 0) and the per-draft
-        snapshot pages (cols ``1..W-1``). The xlite kernels consume ONE widened table
-        ``[rows, W+2]`` (GVirt ``hybrid_mtp_state_contract.md``): col 0 is the read page —
-        the accepted snapshot ``accepted-1`` during verify steps —, cols ``1..W-1`` are the
-        per-token snapshot write pages (a zero entry skips the write), and the two trailing
-        columns carry the conv readRow (``accepted-1``) and writeRows (``K-1+span-1``).
-        Non-speculative rows (accepted count 0) commit their final state to the live page:
-        only their span-length column holds the live page, the other snapshot columns are
-        zero so the span-final token writes the live page and earlier tokens write nothing.
+        The scheduler table ``[rows, W]`` (``W = num_spec + 1``) holds the live page (col 0)
+        and the per-draft snapshot pages: column j is the state-after page of verify-span
+        token j, where token 0 is the already-committed token. The xlite kernels consume ONE
+        widened table ``[rows, W+3]`` (GVirt ``hybrid_mtp_state_contract.md``): col 0 is the
+        read page — the accepted snapshot ``accepted-1`` during verify steps —, cols ``1..W``
+        are the per-span-token snapshot write pages (token t writes column ``1+t``, so the
+        window is the scheduler table shifted right by one; a zero entry skips the write),
+        and the two trailing columns carry the conv readRow (``accepted-1``) and writeRows
+        (``K-1+span-1``). Non-speculative rows (accepted count 0) commit their final state to
+        the live page: only their span-length column holds the live page, the other snapshot
+        columns are zero so the span-final token writes the live page and earlier tokens
+        write nothing.
 
         The buffer is persistent — reallocated only when the batch grows past its capacity —
         so its address stays stable across forwards; every fill below is a device-side op.
         """
         width = table.shape[1]
-        stride = width + 2  # snapshot columns + conv readRow/writeRows
+        stride = width + 3  # read page + shifted scheduler columns + conv readRow/writeRows
         rows = table.shape[0]
         buffers = self._mamba_state_tables if self._mamba_state_tables is not None else {}
         self._mamba_state_tables = buffers
@@ -998,9 +1001,8 @@ class HybridXliteBase(XliteModelBase):
             # The capture batch size is fixed per deployment, so the buffer stops moving
             # once steady state is reached; the capacity never shrinks.
             buf = torch.zeros((rows, stride), dtype=torch.int32, device=table.device)
-            span_cols = torch.arange(1, width, device=table.device)
+            span_cols = torch.arange(1, width + 1, device=table.device)
             buffers[group_id] = (buf, span_cols)
-        buf[:rows, :width].copy_(table)
         counts = torch.zeros(rows, dtype=torch.int64, device=table.device)
         if num_accepted is not None and num_accepted.numel() > 0:
             kept = min(rows, num_accepted.numel())
@@ -1012,16 +1014,14 @@ class HybridXliteBase(XliteModelBase):
         buf[:rows, 0] = torch.where(
             spec, table.gather(1, accepted_col.clamp_max(width - 1).unsqueeze(1)).squeeze(1), live
         )
-        # Snapshot write pages: spec rows keep the scheduler's draft pages verbatim;
-        # non-spec rows expose the live page only at their span-length column.
-        if width > 2:
-            at_span = span_cols == lens[:rows, None]
-            buf[:rows, 1:width] = torch.where(
-                spec[:, None], buf[:rows, 1:width], torch.where(at_span, live[:, None], 0)
-            )
+        # Snapshot write pages: spec rows shift the scheduler table right by one column
+        # (widened col 1+t is span token t's page — token 0 is the committed token on the
+        # live page); non-spec rows expose the live page only at their span-length column.
+        at_span = span_cols == lens[:rows, None]
+        buf[:rows, 1 : width + 1] = torch.where(spec[:, None], table, torch.where(at_span, live[:, None], 0))
         kernel = self.xlite_config.linear_conv_kernel_dim
-        buf[:rows, width] = accepted_col
-        buf[:rows, width + 1] = torch.where(spec, lens[:rows] + (kernel - 2), kernel - 1)
+        buf[:rows, width + 1] = accepted_col
+        buf[:rows, width + 2] = torch.where(spec, lens[:rows] + (kernel - 2), kernel - 1)
         return buf
 
     def augment_attn_meta(

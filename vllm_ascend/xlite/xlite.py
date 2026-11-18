@@ -414,7 +414,13 @@ class XliteModelBase(ABC):
         # Hybrid adapters append their mamba/tail family tables to the common main-KV slot —
         # the constant dummy batch too (its per-family entries are (1,1) zero tables).
         if (augment := getattr(self, "augment_attn_meta", None)) is not None:
-            augment(meta, self._common_attn_metadata_by_group(), self._kv_cache_groups(), is_dummy)
+            augment(
+                meta,
+                self._common_attn_metadata_by_group(),
+                self._kv_cache_groups(),
+                is_dummy,
+                self._num_accepted_tokens(),
+            )
         return meta
 
     def _common_attn_metadata(self) -> AscendCommonAttentionMetadata:
@@ -444,6 +450,32 @@ class XliteModelBase(ABC):
     def _kv_cache_groups(self) -> list[Any]:
         config = getattr(self.npu_runner, "kv_cache_config", None)
         return list(config.kv_cache_groups) if config is not None else []
+
+    def _num_accepted_tokens(self) -> torch.Tensor | None:
+        """Per-request accepted counts from the native GDN metadata, if spec decode is active."""
+        attn_metadata = get_forward_context().attn_metadata
+        values = attn_metadata.values() if isinstance(attn_metadata, dict) else attn_metadata
+        for metadata in values if values is not None else ():
+            accepted = getattr(metadata, "num_accepted_tokens", None)
+            if accepted is None:
+                continue
+            # GDN metadata keeps accepted counts for speculative rows only, in
+            # the original request order. Expand them to the full batch so the
+            # xlite state table rows line up with the common block tables.
+            spec_rows = getattr(metadata, "spec_sequence_masks", None)
+            if spec_rows is not None:
+                mask = spec_rows.to(device=accepted.device, dtype=torch.bool)
+                if mask.numel() > accepted.numel():
+                    expanded = torch.zeros(mask.numel(), dtype=accepted.dtype, device=accepted.device)
+                    expanded[mask] = accepted
+                    return expanded
+                if mask.numel() == accepted.numel():
+                    # Full-graph padding keeps accepted at graph width and
+                    # appends dummy ones after the real rows. Zero the padded
+                    # rows so they are not treated as speculative state rows.
+                    return torch.where(mask, accepted, torch.zeros_like(accepted))
+            return accepted
+        return None
 
     def _init_dummy_metadata(self) -> AttnMetaV2:
         """Build the constant one-token batch used for DP dummy runs (`dummy_batch()`).
@@ -846,6 +878,13 @@ class HybridXliteBase(XliteModelBase):
     """Module name of the KDA (linear-attention) module inside the decoder layer (`linear_attn` in Qwen3.5)."""
     _kda_layer_type: str = "linear_attention"
     """Decoder-layer marker classifying the KDA (linear-attention) family."""
+    _mamba_state_tables: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
+    """Widened MTP state-descriptor buffers per mamba group id: ``(table, span_cols)``.
+
+    Instance lifetime mirrors the adapter (one per runner); rewritten in place each step so
+    the table address stays stable across forwards (graph capture replays hold the address).
+    See :meth:`_accepted_state_page`.
+    """
 
     # ---- model loading ---------------------------------------------------------------------
 
@@ -928,21 +967,95 @@ class HybridXliteBase(XliteModelBase):
         """Pick the main full-attention group's common metadata (group 0 may be a KDA group)."""
         return by_group[self._group_id(kv_cache_groups, self._main_attn_group(kv_cache_groups))]
 
+    def _accepted_state_page(
+        self, group_id: int, table: torch.Tensor, num_accepted: torch.Tensor | None, lens: torch.Tensor
+    ) -> torch.Tensor:
+        """Rewrite the scheduler's mamba block table into xlite's widened state-descriptor layout.
+
+        The scheduler table ``[rows, W]`` holds the committed page (col 0) and the per-draft
+        snapshot pages (cols ``1..W-1``). The xlite kernels consume ONE widened table
+        ``[rows, W+2]`` (GVirt ``hybrid_mtp_state_contract.md``): col 0 is the read page —
+        the accepted snapshot ``accepted-1`` during verify steps —, cols ``1..W-1`` are the
+        per-token snapshot write pages (a zero entry skips the write), and the two trailing
+        columns carry the conv readRow (``accepted-1``) and writeRows (``K-1+span-1``).
+        Non-speculative rows (accepted count 0) commit their final state to the live page:
+        only their span-length column holds the live page, the other snapshot columns are
+        zero so the span-final token writes the live page and earlier tokens write nothing.
+
+        The buffer is persistent — reallocated only when the batch grows past its capacity —
+        so its address stays stable across forwards; every fill below is a device-side op.
+        """
+        width = table.shape[1]
+        stride = width + 2  # snapshot columns + conv readRow/writeRows
+        rows = table.shape[0]
+        buffers = self._mamba_state_tables if self._mamba_state_tables is not None else {}
+        self._mamba_state_tables = buffers
+        cached = buffers.get(group_id)
+        if cached is not None and cached[0].shape[1] == stride and cached[0].shape[0] >= rows:
+            buf, span_cols = cached
+            buf.zero_()
+        else:
+            # The capture batch size is fixed per deployment, so the buffer stops moving
+            # once steady state is reached; the capacity never shrinks.
+            buf = torch.zeros((rows, stride), dtype=torch.int32, device=table.device)
+            span_cols = torch.arange(1, width, device=table.device)
+            buffers[group_id] = (buf, span_cols)
+        buf[:rows, :width].copy_(table)
+        counts = torch.zeros(rows, dtype=torch.int64, device=table.device)
+        if num_accepted is not None and num_accepted.numel() > 0:
+            kept = min(rows, num_accepted.numel())
+            counts[:kept] = num_accepted[:kept].to(device=table.device, dtype=torch.int64)
+        spec = counts > 0
+        accepted_col = (counts - 1).clamp_(min=0)  # accepted snapshot column; also the conv read row
+        live = table[:rows, 0]
+        # Col 0: the accepted snapshot page for spec rows, the live page otherwise.
+        buf[:rows, 0] = torch.where(
+            spec, table.gather(1, accepted_col.clamp_max(width - 1).unsqueeze(1)).squeeze(1), live
+        )
+        # Snapshot write pages: spec rows keep the scheduler's draft pages verbatim;
+        # non-spec rows expose the live page only at their span-length column.
+        if width > 2:
+            at_span = span_cols == lens[:rows, None]
+            buf[:rows, 1:width] = torch.where(
+                spec[:, None], buf[:rows, 1:width], torch.where(at_span, live[:, None], 0)
+            )
+        kernel = self.xlite_config.linear_conv_kernel_dim
+        buf[:rows, width] = accepted_col
+        buf[:rows, width + 1] = torch.where(spec, lens[:rows] + (kernel - 2), kernel - 1)
+        return buf
+
     def augment_attn_meta(
         self,
         meta: AttnMetaV2,
         by_group: dict[int, Any],
         kv_cache_groups: Sequence[Any],
         is_dummy: bool,
+        num_accepted: torch.Tensor | None = None,
     ) -> None:
-        """Append the extra family block tables to the main-KV slot, verbatim."""
+        """Append the extra family block tables to the main-KV slot.
+
+        Mamba tables are rewritten into the widened MTP state-descriptor layout
+        (:meth:`_accepted_state_page`); the kpool tail passes through verbatim.
+        """
         tables = []
+        mamba_mode = getattr(self.vllm_config.cache_config, "mamba_cache_mode", None)
         for group in self._extra_attn_groups(kv_cache_groups):
-            tables.append(
-                torch.zeros((1, 1), dtype=torch.int32, device=self.device)
-                if is_dummy
-                else by_group[self._group_id(kv_cache_groups, group)].block_table_tensor
-            )
+            if is_dummy:
+                tables.append(torch.zeros((1, 1), dtype=torch.int32, device=self.device))
+                continue
+            group_id = self._group_id(kv_cache_groups, group)
+            table = by_group[group_id].block_table_tensor
+            if self._is_mamba_group(group) and table.dim() == 2 and table.shape[1] > 1:
+                if mamba_mode not in (None, "none"):
+                    raise NotImplementedError(
+                        "xlite hybrid state tables require mamba_cache_mode='none'; "
+                        f"got {mamba_mode!r} with table width {table.shape[1]}"
+                    )
+                tables.append(self._accepted_state_page(group_id, table, num_accepted, meta.lens))
+            else:
+                # Width-1 mamba tables (non-MTP) keep the runner's persistent view: the
+                # kernels' legacy path reads col 0 and commits the final state to it.
+                tables.append(table)
         # Rebuild from the common main-KV slot so repeated dummy runs stay idempotent.
         meta.block_tables = [*meta.block_tables[:1], *tables]
 

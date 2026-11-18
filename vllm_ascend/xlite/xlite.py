@@ -1686,8 +1686,11 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         """Build one sparse-MLA layer's family tuple: (main latent k, optional pe plane, indexer kpool, tail ring).
 
         The tail entry is the runner's paged tail-ring pool, passed through as the
-        ``[blocks, index_kpool, 2*index_head_dim]`` fp32 view (each row is one pool
-        slot's ``[k | gate]`` pair); compress/spill is its sole consumer.
+        ``[blocks, ring_capacity, 2*index_head_dim]`` fp32 view (each row is one pool
+        slot's ``[k | gate]`` pair); compress/spill is its sole consumer. The ring
+        capacity is ``block_sizes[2]`` — ``index_kpool`` plus the speculative lookahead
+        when MTP is active (``get_kpool_tail_ring_capacity``), so it exceeds
+        ``index_kpool`` under speculation.
         """
         xcfg = self.xlite_config
         main, indexer_entry, *tail_entries = entries
@@ -1700,7 +1703,9 @@ class Glm5NextXliteModel(HybridXliteBase, DeepseekV32XliteModel):
         family = [k_cache, k_cache[..., :0], indexers[0]]  # NoPE: no rope plane, pe slot stays an empty view
         if tail_entries:
             (tail,) = self._cache_components(tail_entries[0])
-            tail = self._expect_cache_shape(tail, (xcfg.index_kpool, 2 * xcfg.index_head_dim), "tail ring pool", layer)
+            tail = self._expect_cache_shape(
+                tail, (xcfg.block_sizes[2], 2 * xcfg.index_head_dim), "tail ring pool", layer
+            )
             family.append(tail)
         return tuple(family)
 

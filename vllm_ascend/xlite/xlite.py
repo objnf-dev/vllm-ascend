@@ -975,21 +975,24 @@ class HybridXliteBase(XliteModelBase):
         The scheduler table ``[rows, W]`` (``W = num_spec + 1``) holds the live page (col 0)
         and the per-draft snapshot pages: column j is the state-after page of verify-span
         token j, where token 0 is the already-committed token. The xlite kernels consume ONE
-        widened table ``[rows, W+3]`` (GVirt ``hybrid_mtp_state_contract.md``): col 0 is the
-        read page — the accepted snapshot ``accepted-1`` during verify steps —, cols ``1..W``
-        are the per-span-token snapshot write pages (token t writes column ``1+t``, so the
-        window is the scheduler table shifted right by one; a zero entry skips the write),
-        and the two trailing columns carry the conv readRow (``accepted-1``) and writeRows
-        (``K-1+span-1``). Non-speculative rows (accepted count 0) commit their final state to
-        the live page: only their span-length column holds the live page, the other snapshot
-        columns are zero so the span-final token writes the live page and earlier tokens
-        write nothing.
+        widened table ``[rows, W+4]`` (GVirt ``hybrid_mtp_state_contract.md``): col 0 is the
+        SSM read page — the accepted snapshot ``accepted-1`` during verify steps —, cols
+        ``1..W`` are the per-span-token snapshot write pages (token t writes column ``1+t``,
+        so the window is the scheduler table shifted right by one; a zero entry skips the
+        write), col ``W+1`` is the conv page (always the live page: under
+        ``mamba_cache_mode 'none'`` the scheduler never promotes accepted pages, so the conv
+        rolling window must not follow ``accepted-1`` or it would jump pages whenever
+        acceptance varies between steps), and the two trailing columns carry the conv
+        readRow (``accepted-1``) and writeRows (``K-1+span-1``). Non-speculative rows
+        (accepted count 0) commit their final state to the live page: only their
+        span-length column holds the live page, the other snapshot columns are zero so the
+        span-final token writes the live page and earlier tokens write nothing.
 
         The buffer is persistent — reallocated only when the batch grows past its capacity —
         so its address stays stable across forwards; every fill below is a device-side op.
         """
         width = table.shape[1]
-        stride = width + 3  # read page + shifted scheduler columns + conv readRow/writeRows
+        stride = width + 4  # read page + shifted scheduler columns + conv page + conv readRow/writeRows
         rows = table.shape[0]
         buffers = self._mamba_state_tables if self._mamba_state_tables is not None else {}
         self._mamba_state_tables = buffers
@@ -1020,8 +1023,9 @@ class HybridXliteBase(XliteModelBase):
         at_span = span_cols == lens[:rows, None]
         buf[:rows, 1 : width + 1] = torch.where(spec[:, None], table, torch.where(at_span, live[:, None], 0))
         kernel = self.xlite_config.linear_conv_kernel_dim
-        buf[:rows, width + 1] = accepted_col
-        buf[:rows, width + 2] = torch.where(spec, lens[:rows] + (kernel - 2), kernel - 1)
+        buf[:rows, width + 1] = live  # conv page: the rolling window never leaves the live page
+        buf[:rows, width + 2] = accepted_col
+        buf[:rows, width + 3] = torch.where(spec, lens[:rows] + (kernel - 2), kernel - 1)
         return buf
 
     def augment_attn_meta(
